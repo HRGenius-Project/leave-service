@@ -1,145 +1,134 @@
 package com.hrgenius.leave_service.service;
 
 import com.hrgenius.leave_service.dto.LeaveApplication;
-import com.hrgenius.leave_service.dto.LeaveApprovedEvent;
 import com.hrgenius.leave_service.dto.LeaveResponse;
-import com.hrgenius.leave_service.entity.*;
+import com.hrgenius.leave_service.entity.LeaveBalance;
+import com.hrgenius.leave_service.entity.LeaveRequest;
+import com.hrgenius.leave_service.entity.LeaveStatus;
 import com.hrgenius.leave_service.repository.LeaveBalanceRepository;
 import com.hrgenius.leave_service.repository.LeaveRequestRepository;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.time.temporal.ChronoUnit;
 import java.util.List;
-import java.util.stream.Collectors;
 
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class LeaveService {
 
     private final LeaveRequestRepository leaveRequestRepository;
     private final LeaveBalanceRepository leaveBalanceRepository;
-    private final RabbitTemplate rabbitTemplate;
 
-    @Value("${app.rabbitmq.exchange}")
-    private String exchange;
-
-    @Value("${app.rabbitmq.routing-key-leave-approved}")
-    private String routingKeyLeaveApproved;
-
-    public LeaveBalance initializeBalance(String employeeCode) {
-        return leaveBalanceRepository.findByEmployeeCode(employeeCode)
-                .orElseGet(() -> leaveBalanceRepository.save(
-                        LeaveBalance.builder()
-                                .employeeCode(employeeCode)
-                                .casualLeave(12)
-                                .sickLeave(10)
-                                .paidLeave(15)
-                                .build()
-                ));
+    @Transactional(readOnly = true)
+    public List<LeaveResponse> getAllPendingLeaves() {
+        return leaveRequestRepository.findByStatusOrderByAppliedAtDesc(LeaveStatus.PENDING)
+                .stream()
+                .map(this::mapToResponse)
+                .toList();
     }
 
+    @Transactional(readOnly = true)
+    public List<LeaveResponse> getEmployeeLeaves(String employeeCode) {
+        return leaveRequestRepository.findByEmployeeCodeOrderByAppliedAtDesc(employeeCode)
+                .stream()
+                .map(this::mapToResponse)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
     public LeaveBalance getBalance(String employeeCode) {
         return leaveBalanceRepository.findByEmployeeCode(employeeCode)
-                .orElseGet(() -> initializeBalance(employeeCode));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Leave balance record not found"));
     }
 
     @Transactional
     public LeaveResponse applyLeave(LeaveApplication dto) {
         if (dto.getStartDate().isAfter(dto.getEndDate())) {
-            throw new IllegalArgumentException("Start date cannot be after end date");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Start date cannot be after end date");
         }
 
-        int requestedDays = (int) ChronoUnit.DAYS.between(dto.getStartDate(), dto.getEndDate()) + 1;
-        LeaveBalance balance = getBalance(dto.getEmployeeCode());
-
-        boolean hasEnoughBalance = switch (dto.getLeaveType()) {
-            case CASUAL -> balance.getCasualLeave() >= requestedDays;
-            case SICK -> balance.getSickLeave() >= requestedDays;
-            case PAID -> balance.getPaidLeave() >= requestedDays;
-        };
-
-        if (!hasEnoughBalance) {
-            throw new IllegalStateException("Insufficient " + dto.getLeaveType() + " leave balance");
+        boolean hasOverlap = leaveRequestRepository.hasOverlappingLeave(
+                dto.getEmployeeCode(),
+                dto.getStartDate(),
+                dto.getEndDate()
+        );
+        if (hasOverlap) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "An overlapping leave request already exists");
         }
 
-        LeaveRequest leaveRequest = LeaveRequest.builder()
+        long days = ChronoUnit.DAYS.between(dto.getStartDate(), dto.getEndDate()) + 1;
+
+        LeaveRequest request = LeaveRequest.builder()
                 .employeeCode(dto.getEmployeeCode())
                 .leaveType(dto.getLeaveType())
                 .startDate(dto.getStartDate())
                 .endDate(dto.getEndDate())
-                .numberOfDays(requestedDays)
+                .numberOfDays((int) days)
                 .reason(dto.getReason())
                 .status(LeaveStatus.PENDING)
                 .build();
 
-        LeaveRequest saved = leaveRequestRepository.save(leaveRequest);
+        LeaveRequest saved = leaveRequestRepository.save(request);
         return mapToResponse(saved);
     }
 
     @Transactional
-    public LeaveResponse updateLeaveStatus(Long leaveId, LeaveStatus newStatus, String approverCode) {
-        LeaveRequest request = leaveRequestRepository.findById(leaveId)
-                .orElseThrow(() -> new RuntimeException("Leave request not found with ID: " + leaveId));
+    public LeaveResponse updateLeaveStatus(Long id, LeaveStatus status, String approverCode) {
+        LeaveRequest request = leaveRequestRepository.findById(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Leave request not found"));
 
         if (request.getStatus() != LeaveStatus.PENDING) {
-            throw new IllegalStateException("Leave request is already processed: " + request.getStatus());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Only pending leaves can be approved or rejected");
         }
 
-        request.setStatus(newStatus);
+        request.setStatus(status);
         request.setApprovedBy(approverCode);
 
-        if (newStatus == LeaveStatus.APPROVED) {
-            LeaveBalance balance = getBalance(request.getEmployeeCode());
-            switch (request.getLeaveType()) {
-                case CASUAL -> balance.setCasualLeave(balance.getCasualLeave() - request.getNumberOfDays());
-                case SICK -> balance.setSickLeave(balance.getSickLeave() - request.getNumberOfDays());
-                case PAID -> balance.setPaidLeave(balance.getPaidLeave() - request.getNumberOfDays());
-            }
-            leaveBalanceRepository.save(balance);
-
-            // RabbitMQ Event Publish
-            LeaveApprovedEvent event = LeaveApprovedEvent.builder()
-                    .leaveRequestId(request.getId())
-                    .employeeCode(request.getEmployeeCode())
-                    .leaveType(request.getLeaveType().name())
-                    .startDate(request.getStartDate())
-                    .endDate(request.getEndDate())
-                    .numberOfDays(request.getNumberOfDays())
-                    .approvedBy(approverCode)
-                    .build();
-
-            rabbitTemplate.convertAndSend(exchange, routingKeyLeaveApproved, event);
-            log.info("Published leave.approved event for employee: {}", request.getEmployeeCode());
+        if (status == LeaveStatus.APPROVED) {
+            leaveBalanceRepository.findByEmployeeCode(request.getEmployeeCode()).ifPresent(balance -> {
+                deductLeaveBalance(balance, request.getLeaveType().name(), request.getNumberOfDays());
+                leaveBalanceRepository.save(balance);
+            });
         }
 
-        return mapToResponse(leaveRequestRepository.save(request));
+        LeaveRequest updated = leaveRequestRepository.save(request);
+        return mapToResponse(updated);
     }
 
-    public List<LeaveResponse> getEmployeeLeaves(String employeeCode) {
-        return leaveRequestRepository.findByEmployeeCodeOrderByAppliedAtDesc(employeeCode)
-                .stream()
-                .map(this::mapToResponse)
-                .collect(Collectors.toList());
+    private void deductLeaveBalance(LeaveBalance balance, String type, int days) {
+        switch (type.toUpperCase()) {
+            case "CASUAL", "CASUAL_LEAVE" -> {
+                int current = balance.getCasualLeave() != null ? balance.getCasualLeave() : 0;
+                balance.setCasualLeave(Math.max(0, current - days));
+            }
+            case "SICK", "SICK_LEAVE" -> {
+                int current = balance.getSickLeave() != null ? balance.getSickLeave() : 0;
+                balance.setSickLeave(Math.max(0, current - days));
+            }
+            case "PAID", "PAID_LEAVE", "EARNED", "EARNED_LEAVE" -> {
+                int current = balance.getPaidLeave() != null ? balance.getPaidLeave() : 0;
+                balance.setPaidLeave(Math.max(0, current - days));
+            }
+            default -> {}
+        }
     }
 
-    private LeaveResponse mapToResponse(LeaveRequest request) {
+    private LeaveResponse mapToResponse(LeaveRequest lr) {
         return LeaveResponse.builder()
-                .id(request.getId())
-                .employeeCode(request.getEmployeeCode())
-                .leaveType(request.getLeaveType())
-                .startDate(request.getStartDate())
-                .endDate(request.getEndDate())
-                .numberOfDays(request.getNumberOfDays())
-                .reason(request.getReason())
-                .status(request.getStatus())
-                .approvedBy(request.getApprovedBy())
-                .appliedAt(request.getAppliedAt())
+                .id(lr.getId())
+                .employeeCode(lr.getEmployeeCode())
+                .leaveType(lr.getLeaveType())
+                .startDate(lr.getStartDate())
+                .endDate(lr.getEndDate())
+                .numberOfDays(lr.getNumberOfDays())
+                .reason(lr.getReason())
+                .status(lr.getStatus())
+                .approvedBy(lr.getApprovedBy())
+                .appliedAt(lr.getAppliedAt())
                 .build();
     }
 }

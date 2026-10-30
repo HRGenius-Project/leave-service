@@ -18,6 +18,11 @@ public class LeaveController {
 
     private final LeaveService leaveService;
 
+    @GetMapping("/pending")
+    public ResponseEntity<List<LeaveResponse>> getAllPendingLeaves() {
+        return ResponseEntity.ok(leaveService.getAllPendingLeaves());
+    }
+
     @PostMapping("/apply")
     public ResponseEntity<LeaveResponse> applyLeave(@RequestBody LeaveApplication dto) {
         return ResponseEntity.ok(leaveService.applyLeave(dto));
